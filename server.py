@@ -32,6 +32,13 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, StreamingResponse
+from alerts_service import (
+    WS_CLIENTS,
+    alerts_broadcaster,
+    collect_alert_snapshot,
+    configure_hms_lookup,
+    enqueue_alert_snapshot,
+)
 from pydantic import BaseModel, Field, validator
 import sqlite3
 import uvicorn
@@ -499,6 +506,7 @@ class HMSCatalog:
         return (msg, hex_code)
 
 hms = HMSCatalog()
+configure_hms_lookup(hms.lookup)
 
 
 # ========== SERVICE PROCESS MANAGER ==========
@@ -1207,17 +1215,33 @@ class Manager:
         """Verwerk HMS alerts en print errors"""
         try:
             p = payload.get("print", payload)
-            
+
             # HMS alerts
             hms_val = p.get("hms")
-            if hms_val:
-                self._sync_hms_alerts(device_id, hms_val)
-            
-            # Print error
+            printer_name: Optional[str] = None
+            with self.clients_lock:
+                cli = self.clients.get(device_id)
+                if cli:
+                    name = cli.cfg.get("name")
+                    if name:
+                        printer_name = str(name)
+
             print_error = p.get("print_error")
+
+            snapshot = collect_alert_snapshot(
+                device_id,
+                printer_name=printer_name,
+                hms_val=hms_val,
+                print_error_val=print_error,
+            )
+            if snapshot:
+                loop = getattr(app.state, "loop", None)
+                enqueue_alert_snapshot(snapshot, loop=loop)
+
+            # Print error
             if print_error is not None:
                 self._sync_print_error(device_id, print_error)
-        
+
         except Exception as e:
             logger.error(f"Fout bij verwerken alerts {device_id}: {e}")
     
@@ -2306,9 +2330,6 @@ def api_alerts_summary(
     return {"open": 0, "today": 0, "unique_codes": 0}
 
 # ========== WEBSOCKET ==========
-WS_CLIENTS: Set[WebSocket] = set()
-ALERTS_QUEUE: "asyncio.Queue[dict]" = asyncio.Queue()
-
 @app.websocket("/ws/alerts")
 async def ws_alerts(ws: WebSocket):
     """WebSocket voor realtime alerts"""
@@ -2327,24 +2348,6 @@ async def ws_alerts(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
-
-async def alerts_broadcaster():
-    """Broadcast alerts naar alle WebSocket clients"""
-    while True:
-        msg = await ALERTS_QUEUE.get()
-        dead = []
-        payload = json.dumps(msg, separators=(",", ":"))
-        for ws in list(WS_CLIENTS):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            WS_CLIENTS.discard(ws)
-            try:
-                await ws.close()
-            except Exception:
-                pass
 
 # ========== LIFECYCLE EVENTS ==========
 @app.on_event("startup")
